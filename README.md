@@ -163,19 +163,55 @@ curl -s -X POST "$BASE/api/editor/schedules" -H "Content-Type: application/json"
 
 1. **预览（只读）**：弹窗双栏列出——
    - 该版的事件、每个事件在**当版被选的那一条时间主张**（精度、区间、出处、考异）、全部「先于」关系；
-   - 当前草稿中将被替换掉的全部事件（含未选主张）与关系，以及草稿修订号、最新版本号。
-   预览不写任何数据。
-2. **确认恢复**：请求必须提交预览时返回的**草稿修订号**与**最新版本号**。确认成功时系统在一个事务内**原子替换整个草稿**：清空当前草稿的事件 / 主张 / 关系，按该版快照重建，并**只恢复当版被选的主张**（同一事件其它未选主张不恢复）。返回：
+   - 当前草稿中将被替换掉的全部事件（含其全部主张）与关系，以及草稿修订号、最新版本号。
+   预览不写任何数据。以上目标版本、当前草稿全貌、草稿修订号、最新版本号在**同一个只读事务（同一 WAL 快照）**内读出——两个服务进程共用同一库时，即便另一进程在预览读取期间写入事件 / 主张或发布新版本，预览返回的四项内容也必定对应**同一个真实同时存在过的数据库状态**，不会出现「展示旧草稿却返回新修订号」的错位（也就不会让随后的确认误删预览中从未展示过的改动）。
+2. **确认恢复**：请求必须原样提交预览时返回的**草稿修订号**与**最新版本号**。确认在 `BEGIN IMMEDIATE` 写事务内先取写锁再核对版本存在性、最新版本号与草稿修订号；核对通过后**原子替换整个草稿**：清空当前草稿的事件 / 主张 / 关系，按该版快照重建，并**只恢复当版被选的主张**（同一事件其它未选主张不恢复）。返回：
    - 旧快照 id → 新草稿 id 的映射（事件、主张、关系）；
    - 每事件一条的**待选主张**，编辑台据此自动填好单选；
    - 新草稿修订号（每次恢复只推进一次修订号）。
-3. **冲突保护**：确认前若草稿被任何人增删改过（修订号变化），或期间发布了更新的版本（最新版本号变化），返回 **409**（`DRAFT_REVISION_CONFLICT` / `VERSION_CONFLICT`）且**不改动任何数据**，需重新预览再确认；目标版本不存在返回 404。
+3. **冲突保护**：预览后、确认前若草稿被任何人增删改过（修订号变化），或期间发布了更新的版本（最新版本号变化），返回 **409**（`DRAFT_REVISION_CONFLICT` / `VERSION_CONFLICT`）且**整次不改动数据库**，需重新预览再确认；另一进程正持有写事务导致确认方等不到写锁（超时）时同样返回 409 `DRAFT_REVISION_CONFLICT`；目标版本不存在返回 404。**已撤回版本仍可恢复**（预览响应附撤回提示），成功时只复制该版选定的主张，撤回审计记录、历史快照与访客视图均不变。
 
 草稿的任何增、删、改都会推进草稿修订号（含恢复本身）。恢复后：
 
 - **历史快照与访客年表保持不变**（访客仍看当前最新发布版）；
 - 草稿仅含该版内容，仍需「校验能否发布」后正式发布才会公开；
 - 发布仍遵守现有编辑口令、求解校验与 `baseVersionNo` 冲突约定——恢复的是更旧的版本时，请以**当前最新版本号**为 `baseVersionNo` 发布，否则同样收到 409。
+
+两进程共用同一库时的并发调用示例（甲、乙分别打到两个共享 `DB_PATH` 的服务进程）：
+
+```bash
+TOKEN=change-me-please
+A=http://localhost:3000
+B=http://localhost:3001   # 另一个 node src/server.js，DB_PATH 指向同一 SQLite 文件
+
+# 1) 甲取得恢复预览：返回的 version / currentDraft / draftRevisionNo / currentVersionNo 同源
+PV=$(curl -s -H "X-Editor-Token: $TOKEN" "$A/api/editor/restore-preview/1")
+REV=$(node -e 'console.log(JSON.parse(process.argv[1]).draftRevisionNo)' "$PV")
+LATEST=$(node -e 'console.log(JSON.parse(process.argv[1]).currentVersionNo)' "$PV")
+
+# 2) 乙在甲确认前写入事件 / 主张（或在另一进程发布了更新的版本）
+EID=$(curl -s -X POST "$B/api/editor/events" -H "Content-Type: application/json" -H "X-Editor-Token: $TOKEN" \
+  -d '{"title":"并发新事件","description":""}' | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>console.log(JSON.parse(s).event.id))')
+curl -s -X POST "$B/api/editor/events/$EID/claims" -H "Content-Type: application/json" -H "X-Editor-Token: $TOKEN" \
+  -d '{"precision":"year","year":1962,"source":"张德福口述"}' >/dev/null
+
+# 3) 甲沿用预览返回的两个号确认 → 409 冲突，乙的改动原样保留，整次不改库
+curl -s -X POST "$A/api/editor/restore" -H "Content-Type: application/json" -H "X-Editor-Token: $TOKEN" \
+  -d '{"versionNo":1,"draftRevisionNo":'"$REV"',"currentVersionNo":'"$LATEST"'}'
+# {"status":409,"code":"DRAFT_REVISION_CONFLICT",
+#  "message":"草稿冲突：你预览恢复时草稿修订号为 5，现在已变为 7（期间草稿被修改过）。请重新预览后再恢复。",
+#  "currentRevisionNo":7,"expectedRevisionNo":5}
+# （期间是发布了新版则返回 code=VERSION_CONFLICT、currentVersionNo=最新版号）
+
+# 4) 甲重新预览（此时新事件已出现在 currentDraft 中）后再确认 → 200 成功
+PV=$(curl -s -H "X-Editor-Token: $TOKEN" "$A/api/editor/restore-preview/1")
+curl -s -X POST "$A/api/editor/restore" -H "Content-Type: application/json" -H "X-Editor-Token: $TOKEN" \
+  -d '{"versionNo":1,
+       "draftRevisionNo":'"$(node -e 'console.log(JSON.parse(process.argv[1]).draftRevisionNo)' "$PV')"',
+       "currentVersionNo":'"$(node -e 'console.log(JSON.parse(process.argv[1]).currentVersionNo)' "$PV')"'}'
+```
+
+完整可运行的端到端示例见 `examples/concurrent-restore-example.mjs`（自动拉起两个共享同一库的服务进程，只走 HTTP API：预览后改草稿的 409、预览后发新版的 409、预览读取进行中并发写入时「内容与修订号同源、确认结果与展示一致」、404 与重试成功，约 3 秒）。
 
 ### 导入采访整理包（JSON，预览 → 确认）
 
@@ -674,7 +710,9 @@ src/
   dates.js      年/月/日精度 → 覆盖区间（公历序数日）
   solver.js     Tarjan 环检测 + 拓扑下界传播求严格先后可行解
   publish.js    发布事务：再校验 + 版本冲突检查 + 写不可变快照
-  restore.js    恢复草稿：只读预览 + 原子替换事务（修订号/版本号冲突检查、按快照重建）；
+  restore.js    恢复草稿：只读预览（目标版本 / 当前草稿全貌 / 修订号 / 最新版本号
+                在同一 WAL 快照内读出，预览不写库）+ BEGIN IMMEDIATE 原子替换事务
+                （取写锁后做修订号/版本号冲突检查、按快照重建，锁超时也归 409）；
                 事务内登记 draft_restores（草稿代 +1），供并行编辑会话识别对象身份更替
   bundle.js     采访整理包导入：整包校验 + 内容指纹 + 只读预览 + 事务追加（批次防重/修订号冲突检查）
   redact.js     出处遮盖：登记文本与库存出处各自 trim 折叠首尾空白后严格相等匹配
@@ -698,8 +736,8 @@ src/
                 成功提交事务内原子应用（修订号只推进一次）并返回临时编号映射，重复提交幂等
   seed.js       演示数据
 public/         访客页与编辑台（原生 HTML/CSS/JS）
-examples/       采访整理包 JSON 示例；出处遮盖、预约发布、脉络路线（含两万事件长链路线）、版本撤回、勘误附记、并行编辑会话（含跨恢复冲突）curl 调用示例；concurrent-publish-example.mjs 拉起两个共用同一库的服务进程演示版本冲突与草稿冲突
-test/           node:test 单元与端到端测试（含成环、无解、409 冲突、草稿恢复、整理包导入、出处遮盖、预约发布/重启补跑、脉络路线（含两万事件长链路线与随机图新旧求解对照）、版本撤回、勘误附记替代与并发冲突、并行编辑会话三方合并与跨恢复对象身份更替、双连接/多线程发布与预约的草稿快照一致性与草稿冲突）
+examples/       采访整理包 JSON 示例；出处遮盖、预约发布、脉络路线（含两万事件长链路线）、版本撤回、勘误附记、并行编辑会话（含跨恢复冲突）curl 调用示例；concurrent-publish-example.mjs 拉起两个共用同一库的服务进程演示发布 / 预约的版本冲突与草稿冲突；concurrent-restore-example.mjs 演示恢复预览同源只读、预览后草稿 / 版本变化的 409 与重新预览后成功
+test/           node:test 单元与端到端测试（含成环、无解、409 冲突、草稿恢复、整理包导入、出处遮盖、预约发布/重启补跑、脉络路线（含两万事件长链路线与随机图新旧求解对照）、版本撤回、勘误附记替代与并发冲突、并行编辑会话三方合并与跨恢复对象身份更替、双连接/多线程发布与预约的草稿快照一致性与草稿冲突、恢复预览的四字段同源快照 / 确认 409 / 写锁超时冲突）
 ```
 
 ## 主要 HTTP API
@@ -723,10 +761,10 @@ test/           node:test 单元与端到端测试（含成环、无解、409 �
   - 422：`{errors:[{type:missing|cycle|temporal, eventIds, relationIds, message, detail}]}`
   - 409：`{code:"VERSION_CONFLICT", baseVersionNo, currentVersionNo, currentVersion}`
   - 409（多进程共用库并发）：`{code:"DRAFT_REVISION_CONFLICT", expectedRevisionNo, currentRevisionNo, message}`（读草稿与写事务之间草稿被另一进程改动；整次不生成版本，刷新草稿重新确认选择后重试）
-- `GET  /api/editor/restore-preview/:no` — 从第 `:no` 版恢复草稿的只读预览（该版被选内容 + 将被替换的当前草稿），返回 `draftRevisionNo`、`currentVersionNo`；版本不存在 404
-- `POST /api/editor/restore` — 确认恢复；体含 `versionNo`、`draftRevisionNo`、`currentVersionNo`（后两者取预览返回值）
-  - 200：`{restoredFromVersionNo, currentVersionNo, revisionNo, idMap:{events,relations}, pendingSelection:[{eventId,claimId}], draft}`
-  - 409：`{code:"DRAFT_REVISION_CONFLICT"|"VERSION_CONFLICT", ...}`（草稿或最新版本在确认前变化，数据不变）；版本不存在 404；参数非法 400
+- `GET  /api/editor/restore-preview/:no` — 从第 `:no` 版恢复草稿的只读预览，**不写库**；该版被选内容（`version`）、将被替换的当前草稿全貌（`currentDraft`，含全部事件 / 主张 / 关系）、`draftRevisionNo`、`currentVersionNo` 在同一 WAL 快照内读出、四者同源；撤回版附 `retraction` 仍可预览；版本不存在 404
+- `POST /api/editor/restore` — 确认恢复（`BEGIN IMMEDIATE`：取写锁后再核对）；体含 `versionNo`、`draftRevisionNo`、`currentVersionNo`（后两者原样取预览返回值）
+  - 200：`{restoredFromVersionNo, currentVersionNo, revisionNo, idMap:{events,relations}, pendingSelection:[{eventId,claimId}], draft}`（只复制该版每事件选定的一条主张；历史快照与访客视图不变）
+  - 409：`{code:"DRAFT_REVISION_CONFLICT"|"VERSION_CONFLICT", ...}`（预览后草稿或最新版本变化，或写锁等待超时；整次不改库，需重新预览再确认）；版本不存在 404；参数非法 400
 - `POST /api/editor/import-preview` — 整理包只读预览；请求体即整理包 JSON，返回 `fingerprint`、`draftRevisionNo`、`counts`、待写入 `events`/`relations` 与 `alreadyImported` 提示
   - 422：`{code:"BUNDLE_INVALID", problems:[{type, message, ...}]}`（键重复 `duplicate_key`、引用缺失 `missing_reference`、日期非法 `invalid_date`、出处非法 `invalid_source`、自环 `self_relation`、结构非法 `invalid_structure`，整包拒绝）
 - `POST /api/editor/import` — 确认导入；体含 `bundle`（原包）、`fingerprint`、`draftRevisionNo`（后两者取预览返回值）
